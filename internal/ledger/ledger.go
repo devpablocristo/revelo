@@ -9,30 +9,37 @@ import (
 	"errors"
 	"sync"
 	"time"
+
+	"github.com/rentpoints/pointsd/internal/rewards/domain"
 )
 
-type Kind string
+// Aliases preserve the starter's API while the reward model lives in the core.
+type Kind = domain.Kind
 
 const (
-	KindAward    Kind = "award"
-	KindReversal Kind = "reversal"
+	KindAward    = domain.KindAward
+	KindReversal = domain.KindReversal
 )
 
 // Entry is one line of a member's points ledger.
-type Entry struct {
-	MemberID  string
-	PaymentID string
-	Kind      Kind
-	Points    int64  // positive for awards, negative for reversals
-	Month     string // settlement month of the payment, "2006-01" in UTC
-}
+type Entry = domain.Entry
 
 // ErrUnavailable is returned when the ledger cannot be reached. Retrying may succeed.
 var ErrUnavailable = errors.New("ledger: unavailable")
 
+// ErrUnknownPayment is returned when a reversal has no recorded award.
+var ErrUnknownPayment = domain.ErrUnknownPayment
+
+// Store owns the atomicity of reward writes, including across service replicas.
+// Implementations must commit the duplicate check, cap calculation and entry
+// together; separate HasEntry/AwardedInMonth/Append calls cannot do this.
 type Store interface {
+	domain.Ledger
+
 	HasEntry(ctx context.Context, paymentID string, kind Kind) (bool, error)
 	AwardedInMonth(ctx context.Context, memberID, month string) (int64, error)
+	// Append is a raw write for fixtures and local setup, without reward rules.
+	// Reward processing must use Award and Reverse instead.
 	Append(ctx context.Context, e Entry) error
 	Balance(ctx context.Context, memberID string) (int64, error)
 }
@@ -58,6 +65,8 @@ type MemoryStore struct {
 	entries []Entry
 }
 
+var _ Store = (*MemoryStore)(nil)
+
 func NewMemoryStore(opts ...Option) *MemoryStore {
 	s := &MemoryStore{}
 	for _, o := range opts {
@@ -67,6 +76,9 @@ func NewMemoryStore(opts ...Option) *MemoryStore {
 }
 
 func (s *MemoryStore) roundTrip(ctx context.Context, op string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if s.latency > 0 {
 		select {
 		case <-time.After(s.latency):
@@ -75,8 +87,69 @@ func (s *MemoryStore) roundTrip(ctx context.Context, op string) error {
 		}
 	}
 	if s.faults != nil {
-		return s.faults(op)
+		if err := s.faults(op); err != nil {
+			return err
+		}
 	}
+	return ctx.Err()
+}
+
+// Award models one database transaction. The simulated round trip is outside
+// the lock so unrelated members do not wait on each other's I/O. This mutex is
+// shared by all handlers using this store; it is not a production replica lock.
+func (s *MemoryStore) Award(ctx context.Context, e Entry, monthlyCap int64) error {
+	if err := s.roundTrip(ctx, "award"); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	var used int64
+	for _, entry := range s.entries {
+		if entry.Kind != KindAward {
+			continue
+		}
+		if entry.PaymentID == e.PaymentID {
+			return nil
+		}
+		if entry.MemberID == e.MemberID && entry.Month == e.Month {
+			used += entry.Points
+		}
+	}
+	s.entries = append(s.entries, e.CappedAward(used, monthlyCap))
+	return nil
+}
+
+func (s *MemoryStore) Reverse(ctx context.Context, paymentID string) error {
+	if err := s.roundTrip(ctx, "reverse"); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	var award Entry
+	found := false
+	for _, entry := range s.entries {
+		if entry.PaymentID != paymentID {
+			continue
+		}
+		if entry.Kind == KindReversal {
+			return nil
+		}
+		if entry.Kind == KindAward {
+			award, found = entry, true
+		}
+	}
+	if !found {
+		return ErrUnknownPayment
+	}
+	s.entries = append(s.entries, award.Reversal())
 	return nil
 }
 

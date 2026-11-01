@@ -9,20 +9,25 @@ import (
 	"github.com/rentpoints/pointsd/internal/events"
 	"github.com/rentpoints/pointsd/internal/ledger"
 	"github.com/rentpoints/pointsd/internal/pubsub"
+	"github.com/rentpoints/pointsd/internal/rewards/domain"
 )
 
 // ErrUnknownPayment is returned for a reversal of a payment that was never awarded.
-var ErrUnknownPayment = errors.New("rewards: reversal for unknown payment")
+var ErrUnknownPayment = domain.ErrUnknownPayment
 
 type Handler struct {
-	store      ledger.Store
-	policy     Policy
+	service    *domain.Service
 	deadLetter pubsub.Publisher
 	log        *slog.Logger
 }
 
-func NewHandler(store ledger.Store, policy Policy, deadLetter pubsub.Publisher, log *slog.Logger) *Handler {
-	return &Handler{store: store, policy: policy, deadLetter: deadLetter, log: log}
+func NewHandler(
+	store ledger.Store,
+	policy Policy,
+	deadLetter pubsub.Publisher,
+	log *slog.Logger,
+) *Handler {
+	return &Handler{service: domain.NewService(store, policy), deadLetter: deadLetter, log: log}
 }
 
 // Handle processes one delivery. The subscriber calls it concurrently
@@ -41,7 +46,14 @@ func (h *Handler) Handle(ctx context.Context, msg pubsub.Message) {
 	}
 
 	if err := h.process(ctx, ev); err != nil {
+		if errors.Is(err, ErrUnknownPayment) {
+			h.log.Warn("reversal for unknown payment", "payment_id", ev.PaymentID, "err", err)
+			msg.Ack()
+			return
+		}
 		h.log.Error("processing failed", "payment_id", ev.PaymentID, "type", ev.Type, "err", err)
+		msg.Nack()
+		return
 	}
 	msg.Ack()
 }
@@ -49,62 +61,14 @@ func (h *Handler) Handle(ctx context.Context, msg pubsub.Message) {
 func (h *Handler) process(ctx context.Context, ev events.Payment) error {
 	switch ev.Type {
 	case events.TypeSettled:
-		return h.award(ctx, ev)
+		return h.service.Award(ctx, domain.Settlement{
+			PaymentID:   ev.PaymentID,
+			MemberID:    ev.MemberID,
+			AmountCents: ev.AmountCents,
+			SettledAt:   ev.OccurredAt,
+		})
 	case events.TypeReversed:
-		return h.reverse(ctx, ev)
+		return h.service.Reverse(ctx, ev.PaymentID)
 	}
 	return nil
-}
-
-func (h *Handler) award(ctx context.Context, ev events.Payment) error {
-	seen, err := h.store.HasEntry(ctx, ev.PaymentID, ledger.KindAward)
-	if err != nil {
-		return err
-	}
-	if seen {
-		return nil
-	}
-
-	month := Month(ev.OccurredAt)
-	used, err := h.store.AwardedInMonth(ctx, ev.MemberID, month)
-	if err != nil {
-		return err
-	}
-	points := h.policy.Points(ev.AmountCents)
-	if room := h.policy.MonthlyCap - used; points > room {
-		points = max(room, 0)
-	}
-
-	return h.store.Append(ctx, ledger.Entry{
-		MemberID:  ev.MemberID,
-		PaymentID: ev.PaymentID,
-		Kind:      ledger.KindAward,
-		Points:    points,
-		Month:     month,
-	})
-}
-
-func (h *Handler) reverse(ctx context.Context, ev events.Payment) error {
-	awarded, err := h.store.HasEntry(ctx, ev.PaymentID, ledger.KindAward)
-	if err != nil {
-		return err
-	}
-	if !awarded {
-		return ErrUnknownPayment
-	}
-	done, err := h.store.HasEntry(ctx, ev.PaymentID, ledger.KindReversal)
-	if err != nil {
-		return err
-	}
-	if done {
-		return nil
-	}
-
-	return h.store.Append(ctx, ledger.Entry{
-		MemberID:  ev.MemberID,
-		PaymentID: ev.PaymentID,
-		Kind:      ledger.KindReversal,
-		Points:    -h.policy.Points(ev.AmountCents),
-		Month:     Month(ev.OccurredAt),
-	})
 }
